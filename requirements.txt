@@ -31,3 +31,8 @@ huggingface-hub>=0.26.2
 gdown==5.2.0
 pydub
 xls_r_sqa
+wandb>=0.16.0
+datasets>=2.14.0
+pyarrow>=8.0.0
+google-cloud-storage>=2.10.0
+webrtcvad>=2.0.10

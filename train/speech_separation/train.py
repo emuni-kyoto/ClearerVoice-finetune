@@ -1,5 +1,6 @@
 import yamlargparse, os, random
 import numpy as np
+import wandb
 
 import torch
 from dataloader.dataloader import get_dataloader
@@ -17,6 +18,25 @@ def main(args):
     torch.manual_seed(args.seed)
     device = torch.device('cuda') if args.use_cuda else torch.device('cpu')
     args.device = device
+    
+    # Initialize wandb for the main process only
+    if (args.distributed and args.local_rank == 0) or not args.distributed:
+        if args.use_wandb:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.exp_name,
+                config=vars(args),
+                resume="allow" if args.train_from_last_checkpoint else None
+            )
+            # Log model architecture info
+            wandb.config.update({
+                "network": args.network,
+                "batch_size": args.batch_size,
+                "effective_batch_size": args.effec_batch_size,
+                "learning_rate": args.init_learning_rate,
+                "sampling_rate": args.sampling_rate,
+                "num_spks": args.num_spks
+            })
 
     if args.distributed:
         torch.cuda.set_device(args.local_rank)
@@ -56,6 +76,11 @@ def main(args):
                 test_data = test_generator
                 ) 
     solver.train()
+    
+    # Finish wandb run
+    if (args.distributed and args.local_rank == 0) or not args.distributed:
+        if args.use_wandb:
+            wandb.finish()
 
 
 if __name__ == '__main__':
@@ -75,6 +100,10 @@ if __name__ == '__main__':
     parser.add_argument('--print_freq', type=int, default=10, help='No. steps waited for printing info')
     parser.add_argument('--checkpoint_save_freq', type=int, default=50, help='No. steps waited for saving new checkpoint')
     parser.add_argument('--batch_size', type=int, help='Batch size')
+    
+    # Wandb configuration
+    parser.add_argument('--use_wandb', type=int, default=1, help='Whether to use wandb for logging (0 or 1)')
+    parser.add_argument('--wandb_project', type=str, default='clearervoice-finetune', help='Wandb project name')
 
     # dataset settings
     parser.add_argument('--load-type', dest='load_type', type=str, help='training data format: one_input_one_output, one_input_multi_outputs')

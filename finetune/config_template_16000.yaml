@@ -1,0 +1,60 @@
+# Configuration for 16kHz speech separation finetuning
+# Based on ClearerVoice MossFormer2_SS_16K model
+
+# Experiment settings
+exp_name: PLACEHOLDER_EXP_NAME
+network: MossFormer2_SS_16K
+save_folder: checkpoints/
+checkpoint_dir: PLACEHOLDER_CHECKPOINT_DIR
+
+# Data configuration - MUST use absolute paths
+tr_list: PLACEHOLDER_TRAIN_SCP
+cv_list: PLACEHOLDER_VALID_SCP
+tt_list: PLACEHOLDER_TEST_SCP
+
+# Audio processing settings
+sampling_rate: 16000
+load_type: one_input_multi_outputs  # One mixture, multiple outputs
+num_spks: 2  # Number of speakers to separate
+audio_norm: true  # Normalize audio
+
+# Training segment configuration
+max_length: 2  # Maximum segment length in seconds
+segment_length: 32000  # Samples (2 seconds at 16kHz)
+
+# Batch configuration
+batch_size: 1  # Per GPU batch size
+effec_batch_size: 8  # Effective batch size with gradient accumulation
+accu_grad: 8  # Gradient accumulation steps
+num_workers: 4  # Dataloader workers
+
+# Training hyperparameters
+max_epoch: 50
+init_learning_rate: 0.00015  # For training from scratch
+finetune_learning_rate: 0.00005  # For finetuning
+weight_decay: 0.00001
+clip_grad_norm: 10.0  # Gradient clipping
+loss_threshold: -9999.0  # Minimum loss threshold
+
+# Model architecture parameters
+encoder_kernel_size: 16
+encoder_embedding_dim: 512
+mossformer_sequence_dim: 512
+num_mossformer_layer: 24
+
+# Checkpoint configuration
+train_from_last_checkpoint: 0  # 0: from init_checkpoint, 1: from last checkpoint
+init_checkpoint_path: ./pretrained_models/MossFormer2_SS_16K.pth
+checkpoint_save_freq: 5  # Save checkpoint every N epochs
+
+# Hardware and system settings
+use_cuda: 1
+distributed: 0  # Set to 1 for multi-GPU training
+seed: 777
+
+# Logging configuration
+print_freq: 100  # Print frequency (iterations)
+
+# Decoding configuration (for inference)
+decode_window: 1  # Window size in seconds
+onetime_decode_length: 60  # Maximum length for one-time decoding

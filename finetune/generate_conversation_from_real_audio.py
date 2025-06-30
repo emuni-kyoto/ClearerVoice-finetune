@@ -5,24 +5,43 @@ This script:
 1. Loads preprocessed parquet files from GCP containing single-speaker audio
 2. Efficiently loads files one-by-one until sufficient data is collected
 3. Handles audio paths: GCS URLs (gs://...), mount paths (/mnt/disks/...), and local paths
-4. Selects samples with only one speaker
-5. Splits audio from different speakers into segments based on pauses or randomly
-6. Creates synthetic conversations by overlapping segments from different speakers
-7. Saves in ClearerVoice format for finetuning
+4. Extracts lightweight speaker embeddings using MFCC-based features
+5. Selects samples with only one speaker
+6. Splits audio from different speakers into segments based on pauses or randomly
+7. Creates synthetic conversations by overlapping segments from different speakers
+8. Supports hard/easy sample generation based on speaker similarity
+9. Saves in ClearerVoice format for finetuning
+
+Features:
+- Speaker embedding extraction using fast MFCC-based features
+- Hard sample generation: Conversations between similar speakers
+- Easy sample generation: Conversations between dissimilar speakers
+- Diverse speaker pair selection to avoid repetition
+- Configurable hard sample percentage (default: 30%)
 
 Usage:
     python generate_conversation_from_real_audio.py \
         --output_dir ./real_conversation_data \
         --bucket_name audio_datasets_emuni \
-        --prefix parquet_processed/ja \
+        --prefix podcast/parquet_processed/train \
         --num_conversations 100 \
         --sample_rate 8000 \
-        --max_samples 1000
+        --max_samples 1000 \
+        --hard_sample_percentage 0.3
+    
+Usage for testing:
+    python generate_conversation_from_real_audio.py \
+      --output_dir ./real_conversation_data \
+      --bucket_name audio_datasets_emuni \
+      --prefix podcast/parquet_processed/train \
+      --num_conversations 10 \ 
+      --sample_rate 8000 --max_samples 10
 
 Optional flags:
     --streaming: Enable streaming mode for processing (experimental)
     --max_samples: Maximum number of single-speaker samples to load (default: 1000)
     --no-vad: Disable VAD and use random segmentation (useful when VAD fails)
+    --hard_sample_percentage: Percentage of hard samples with similar speakers (0.0-1.0, default: 0.3)
 
 Note: Audio files from GCS are cached locally in /tmp/audio_downloads/ for efficiency.
 """
@@ -37,12 +56,14 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import datasets
+import librosa
 import numpy as np
 import soundfile as sf
 import torchaudio
 import webrtcvad
 from google.cloud import storage
 from scipy import signal
+from scipy.spatial.distance import cosine
 from tqdm import tqdm
 
 
@@ -85,6 +106,77 @@ def setup_logging(output_dir: str) -> logging.Logger:
     logger.addHandler(console_handler)
     
     return logger
+
+
+def extract_speaker_embedding(audio: np.ndarray, sample_rate: int, logger: logging.Logger = None) -> np.ndarray:
+    """Extract lightweight speaker embedding using MFCC features.
+    
+    This is a fast, cheap method that captures speaker characteristics.
+    Returns a fixed-size embedding vector.
+    """
+    if logger is None:
+        logger = logging.getLogger('real_conversation_generator')
+    
+    try:
+        # Ensure audio is mono
+        if len(audio.shape) > 1:
+            audio = audio.mean(axis=0)
+        
+        # Extract MFCC features (13 coefficients)
+        mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=13)
+        
+        # Compute statistics over time to get a fixed-size embedding
+        # Mean and std of each MFCC coefficient
+        mfcc_mean = np.mean(mfccs, axis=1)
+        mfcc_std = np.std(mfccs, axis=1)
+        
+        # Extract additional spectral features for better speaker discrimination
+        # Spectral centroid (brightness)
+        spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sample_rate)
+        sc_mean = np.mean(spectral_centroid)
+        sc_std = np.std(spectral_centroid)
+        
+        # Zero crossing rate (voice characteristics)
+        zcr = librosa.feature.zero_crossing_rate(audio)
+        zcr_mean = np.mean(zcr)
+        zcr_std = np.std(zcr)
+        
+        # Spectral rolloff
+        spectral_rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sample_rate)
+        sr_mean = np.mean(spectral_rolloff)
+        sr_std = np.std(spectral_rolloff)
+        
+        # Combine all features into a single embedding vector
+        embedding = np.concatenate([
+            mfcc_mean,      # 13 values
+            mfcc_std,       # 13 values
+            [sc_mean, sc_std, zcr_mean, zcr_std, sr_mean, sr_std]  # 6 values
+        ])
+        
+        # Total: 32-dimensional embedding
+        return embedding.astype(np.float32)
+        
+    except Exception as e:
+        logger.warning(f"Failed to extract speaker embedding: {e}")
+        # Return random embedding as fallback
+        return np.random.randn(32).astype(np.float32)
+
+
+def compute_embedding_similarity(embedding1: np.ndarray, embedding2: np.ndarray) -> float:
+    """Compute similarity between two speaker embeddings using cosine similarity.
+    
+    Returns:
+        Similarity score between 0 and 1 (1 = identical, 0 = very different)
+    """
+    # Normalize embeddings
+    embedding1_norm = embedding1 / (np.linalg.norm(embedding1) + 1e-8)
+    embedding2_norm = embedding2 / (np.linalg.norm(embedding2) + 1e-8)
+    
+    # Compute cosine similarity (1 - cosine distance)
+    similarity = 1 - cosine(embedding1_norm, embedding2_norm)
+    
+    # Ensure similarity is in [0, 1] range
+    return np.clip(similarity, 0, 1)
 
 
 def list_parquet_files(bucket_name: str, prefix: str, logger: logging.Logger) -> List[str]:
@@ -330,7 +422,7 @@ def load_audio_from_path(audio_path: str, logger: logging.Logger, bucket_name: s
                     logger.debug(f"Downloading from GCS: gs://{bucket_name}/{relative_path} to {temp_path}")
                     try:
                         blob.download_to_filename(str(temp_path))
-                        logger.debug(f"Successfully downloaded audio file")
+                        logger.debug("Successfully downloaded audio file")
                     except Exception as download_error:
                         if temp_path.exists():
                             temp_path.unlink()  # Remove partial download
@@ -1005,7 +1097,8 @@ def generate_conversations_from_real_audio(output_dir: str,
                                          target_duration: float = 30.0,
                                          max_samples_to_load: int = 1000,
                                          streaming: bool = False,
-                                         use_vad: bool = True) -> None:
+                                         use_vad: bool = True,
+                                         hard_sample_percentage: float = 0.3) -> None:
     """Generate conversation dataset from real single-speaker audio files."""
     
     # Setup logging
@@ -1020,6 +1113,7 @@ def generate_conversations_from_real_audio(output_dir: str,
     logger.info(f"Target duration: {target_duration} seconds")
     logger.info(f"Streaming mode: {'enabled' if streaming else 'disabled'}")
     logger.info(f"VAD segmentation: {'enabled' if use_vad else 'disabled (using random segmentation)'}")
+    logger.info(f"Hard sample percentage: {hard_sample_percentage * 100:.0f}% (similar speakers)")
     logger.info(f"Early stopping: Will process up to {target_duration * 2:.0f}s of audio per file")
     
     # List parquet files
@@ -1050,8 +1144,9 @@ def generate_conversations_from_real_audio(output_dir: str,
     # Process audio files and create segment pool by speaker
     logger.info("Processing audio files and creating segment pools by speaker...")
     
-    # Dictionary to store segments by speaker (file source)
+    # Dictionary to store segments and embeddings by speaker (file source)
     segments_by_speaker = {}
+    embeddings_by_speaker = {}
     processed_files = 0
     
     # Process audio files in batches
@@ -1091,6 +1186,10 @@ def generate_conversations_from_real_audio(output_dir: str,
                 if sample_rate != target_sample_rate:
                     audio = resample_audio(audio, sample_rate, target_sample_rate)
                 
+                # Extract speaker embedding from the audio (use first 30 seconds for consistency)
+                embedding_audio = audio[:int(30 * target_sample_rate)]  # Use up to 30 seconds
+                speaker_embedding = extract_speaker_embedding(embedding_audio, target_sample_rate, logger)
+                
                 # Split into segments - only process enough audio for ~2x target conversation duration
                 # This avoids processing very long audio files unnecessarily
                 target_accumulated = target_duration * 2.0  # Process 2x the target conversation duration
@@ -1100,6 +1199,7 @@ def generate_conversations_from_real_audio(output_dir: str,
                 if segments:
                     if speaker_id not in segments_by_speaker:
                         segments_by_speaker[speaker_id] = []
+                        embeddings_by_speaker[speaker_id] = speaker_embedding
                     segments_by_speaker[speaker_id].extend(segments)
                     processed_files += 1
                 
@@ -1165,15 +1265,101 @@ def generate_conversations_from_real_audio(output_dir: str,
     # Convert speaker dict to list for easier sampling
     speaker_list = list(valid_speakers.keys())
     
+    # Pre-compute similarity matrix for efficient speaker pair selection
+    logger.info("Computing speaker similarity matrix...")
+    similarity_matrix = {}
+    for i, speaker1 in enumerate(speaker_list):
+        for j, speaker2 in enumerate(speaker_list):
+            if i < j:  # Only compute upper triangle
+                similarity = compute_embedding_similarity(
+                    embeddings_by_speaker[speaker1],
+                    embeddings_by_speaker[speaker2]
+                )
+                similarity_matrix[(speaker1, speaker2)] = similarity
+                similarity_matrix[(speaker2, speaker1)] = similarity  # Symmetric
+    
+    # Track used speaker pairs to ensure diversity
+    used_pairs = set()
+    hard_samples_count = 0
+    
     for i in tqdm(range(num_conversations), desc="Generating conversations"):
         try:
+            # Determine if this should be a hard sample
+            is_hard_sample = (i / num_conversations) < hard_sample_percentage
+            
             # Select two different speakers for this conversation
             if len(speaker_list) == 2:
                 # If we only have 2 speakers, use them
                 speaker1_id, speaker2_id = speaker_list
             else:
-                # Randomly select 2 different speakers
-                speaker1_id, speaker2_id = random.sample(speaker_list, 2)
+                # Select speakers based on whether this is a hard sample
+                if is_hard_sample:
+                    # Find similar speaker pairs (hard samples)
+                    # Get all possible pairs sorted by similarity
+                    all_pairs = [(s1, s2, sim) for (s1, s2), sim in similarity_matrix.items() 
+                                if s1 < s2]  # Avoid duplicates
+                    all_pairs.sort(key=lambda x: x[2], reverse=True)  # Sort by similarity (high to low)
+                    
+                    # Select from top 25% most similar pairs that haven't been used recently
+                    similar_threshold = int(len(all_pairs) * 0.25)
+                    candidate_pairs = all_pairs[:similar_threshold]
+                    
+                    # Try to find an unused or least recently used pair
+                    selected_pair = None
+                    for s1, s2, sim in candidate_pairs:
+                        pair_key = tuple(sorted([s1, s2]))
+                        if pair_key not in used_pairs:
+                            selected_pair = (s1, s2)
+                            break
+                    
+                    # If all similar pairs have been used, select the least recently used one
+                    if selected_pair is None and candidate_pairs:
+                        s1, s2, _ = random.choice(candidate_pairs)
+                        selected_pair = (s1, s2)
+                    
+                    if selected_pair:
+                        speaker1_id, speaker2_id = selected_pair
+                        hard_samples_count += 1
+                        logger.debug(f"Hard sample {hard_samples_count}: similarity = {similarity_matrix[(speaker1_id, speaker2_id)]:.3f}")
+                    else:
+                        # Fallback to random selection
+                        speaker1_id, speaker2_id = random.sample(speaker_list, 2)
+                else:
+                    # Easy sample: select dissimilar speakers
+                    # Get all possible pairs sorted by similarity
+                    all_pairs = [(s1, s2, sim) for (s1, s2), sim in similarity_matrix.items() 
+                                if s1 < s2]  # Avoid duplicates
+                    all_pairs.sort(key=lambda x: x[2])  # Sort by similarity (low to high)
+                    
+                    # Select from bottom 50% least similar pairs
+                    dissimilar_threshold = int(len(all_pairs) * 0.5)
+                    candidate_pairs = all_pairs[:dissimilar_threshold]
+                    
+                    # Try to find an unused or least recently used pair
+                    selected_pair = None
+                    for s1, s2, sim in candidate_pairs:
+                        pair_key = tuple(sorted([s1, s2]))
+                        if pair_key not in used_pairs:
+                            selected_pair = (s1, s2)
+                            break
+                    
+                    # If all dissimilar pairs have been used, select randomly
+                    if selected_pair is None and candidate_pairs:
+                        s1, s2, _ = random.choice(candidate_pairs)
+                        selected_pair = (s1, s2)
+                    
+                    if selected_pair:
+                        speaker1_id, speaker2_id = selected_pair
+                    else:
+                        # Fallback to random selection
+                        speaker1_id, speaker2_id = random.sample(speaker_list, 2)
+            
+            # Track used pairs (keep only last N pairs to allow reuse after some time)
+            pair_key = tuple(sorted([speaker1_id, speaker2_id]))
+            used_pairs.add(pair_key)
+            if len(used_pairs) > max(20, num_conversations // 5):  # Keep track of recent pairs
+                # Remove oldest pair (convert to list, remove first, convert back)
+                used_pairs = set(list(used_pairs)[1:])
             
             speaker1_segments = valid_speakers[speaker1_id]
             speaker2_segments = valid_speakers[speaker2_id]
@@ -1189,18 +1375,45 @@ def generate_conversations_from_real_audio(output_dir: str,
             speaker1_name = Path(speaker1_id).name if '/' in speaker1_id else speaker1_id
             speaker2_name = Path(speaker2_id).name if '/' in speaker2_id else speaker2_id
             logger.info(f"Conversation {i}: {speaker1_name} vs {speaker2_name}")
+            logger.debug(f"Using {len(s1_segments)} segments from speaker1, {len(s2_segments)} segments from speaker2")
             
+            # Validate segments
+            if not s1_segments or not s2_segments:
+                logger.error(f"No segments available for conversation {i}")
+                failed_generations += 1
+                continue
+                
             # Create conversation
             mixed, speaker1, speaker2 = create_conversation_from_segments(
                 s1_segments, s2_segments, target_sample_rate,
                 overlap_ratio=0.2, target_duration=target_duration, logger=logger
             )
             
+            # Validate audio data
+            for audio_name, audio_data in [("mixed", mixed), ("speaker1", speaker1), ("speaker2", speaker2)]:
+                if audio_data is None:
+                    raise ValueError(f"{audio_name} audio is None")
+                if len(audio_data) == 0:
+                    raise ValueError(f"{audio_name} audio is empty")
+                if np.any(np.isnan(audio_data)):
+                    raise ValueError(f"{audio_name} audio contains NaN values")
+                if np.any(np.isinf(audio_data)):
+                    raise ValueError(f"{audio_name} audio contains Inf values")
+                logger.debug(f"{audio_name} audio: shape={audio_data.shape}, dtype={audio_data.dtype}, range=[{audio_data.min():.3f}, {audio_data.max():.3f}]")
+            
             # Save audio files
             conversation_id = f"conversation_{i:04d}"
             mix_file = (mix_dir / f"{conversation_id}_mix.wav").absolute()
             s1_file = (s1_dir / f"{conversation_id}_s1.wav").absolute()
             s2_file = (s2_dir / f"{conversation_id}_s2.wav").absolute()
+            
+            # Ensure directories exist before writing
+            mix_file.parent.mkdir(parents=True, exist_ok=True)
+            s1_file.parent.mkdir(parents=True, exist_ok=True)
+            s2_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Debug logging
+            logger.debug(f"Writing to: {mix_file}")
             
             sf.write(str(mix_file), mixed, target_sample_rate)
             sf.write(str(s1_file), speaker1, target_sample_rate)
@@ -1221,6 +1434,8 @@ def generate_conversations_from_real_audio(output_dir: str,
             
         except Exception as e:
             logger.error(f"Error generating conversation {i}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             failed_generations += 1
             continue
     
@@ -1229,6 +1444,9 @@ def generate_conversations_from_real_audio(output_dir: str,
     if successful_generations == 0:
         logger.error("No conversations were successfully generated!")
         return
+    
+    logger.info(f"Hard samples (similar speakers): {hard_samples_count} ({hard_samples_count/successful_generations*100:.1f}%)")
+    logger.info(f"Easy samples (dissimilar speakers): {successful_generations - hard_samples_count} ({(successful_generations - hard_samples_count)/successful_generations*100:.1f}%)")
     
     # Create train/valid/test splits
     random.shuffle(all_data)
@@ -1296,6 +1514,8 @@ def main():
                       help="Use streaming mode for memory-efficient processing")
     parser.add_argument("--no-vad", action="store_true",
                       help="Disable VAD and use random segmentation instead")
+    parser.add_argument("--hard_sample_percentage", type=float, default=0.3,
+                      help="Percentage of conversations that should be hard samples (similar speakers, 0.0-1.0)")
     
     args = parser.parse_args()
     
@@ -1308,7 +1528,8 @@ def main():
         args.target_duration,
         args.max_samples,
         args.streaming,
-        use_vad=not args.no_vad
+        use_vad=not args.no_vad,
+        hard_sample_percentage=args.hard_sample_percentage
     )
 
 

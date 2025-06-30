@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from losses.loss import loss_mossformer2_ss
+import wandb
 
 class Solver(object):
     def __init__(self, args, model, optimizer, train_data, validation_data, test_data):
@@ -15,9 +16,11 @@ class Solver(object):
         self.device = self.args.device
 
         self.print = False
+        self.use_wandb = False
         if (self.args.distributed and self.args.local_rank ==0) or not self.args.distributed:
             self.print = True
             self.writer = SummaryWriter('%s/tensorboard/' % args.checkpoint_dir)
+            self.use_wandb = args.use_wandb and wandb.run is not None
 
         self.model = model
         self.optimizer=optimizer
@@ -222,12 +225,34 @@ class Solver(object):
                 self.writer.add_scalar('Validation_loss', val_loss, epoch)
                 if self.args.tt_list is not None:
                     self.writer.add_scalar('Test_loss', test_loss, epoch)
+                    
+                # Wandb logging
+                if self.use_wandb:
+                    wandb_logs = {
+                        'epoch': epoch,
+                        'train_loss': tr_loss,
+                        'val_loss': val_loss,
+                        'learning_rate': self.optimizer.param_groups[0]['lr'],
+                        'best_val_loss': self.best_val_loss,
+                        'val_no_improvement': self.val_no_impv
+                    }
+                    if self.args.tt_list is not None:
+                        wandb_logs['test_loss'] = test_loss
+                    wandb.log(wandb_logs)
 
             # Save model
             self.save_checkpoint()
             if find_best_model:
                 self.save_checkpoint(mode='last_best_checkpoint')
                 print("Found new best model, dict saved")
+                # Save best model to wandb
+                if self.use_wandb:
+                    wandb.run.summary["best_val_loss"] = self.best_val_loss
+                    wandb.run.summary["best_epoch"] = epoch
+                    # Save model artifact
+                    best_model_path = os.path.join(self.args.checkpoint_dir, 'best_model.pth')
+                    torch.save(self.model.state_dict(), best_model_path)
+                    wandb.save(best_model_path)
             self.epoch = self.epoch + 1
 
     def _run_one_epoch_mossformer2_ss(self, data_loader, state='train'):
@@ -278,12 +303,21 @@ class Solver(object):
                     eplashed = time.time() - stime
                     speed_avg = eplashed / (i+1)
                     mix_loss_print_avg = mix_loss_print / self.args.print_freq
-                    if self.print: print('Train Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} |'
-                      ' Total_Loss {:2.4f}'
-                      .format(self.epoch, self.args.max_epoch,
-                          i+1, num_batch, speed_avg, self.optimizer.param_groups[0]["lr"],
-                          mix_loss_print_avg,
-                        ))
+                    if self.print: 
+                        print('Train Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} |'
+                          ' Total_Loss {:2.4f}'
+                          .format(self.epoch, self.args.max_epoch,
+                              i+1, num_batch, speed_avg, self.optimizer.param_groups[0]["lr"],
+                              mix_loss_print_avg,
+                            ))
+                        # Log step-wise metrics to wandb
+                        if self.use_wandb:
+                            wandb.log({
+                                'step': self.step,
+                                'step_loss': mix_loss_print_avg,
+                                'batch_time': speed_avg,
+                                'learning_rate': self.optimizer.param_groups[0]["lr"]
+                            })
                     mix_loss_print = 0.0
                 if (i + 1) % self.args.checkpoint_save_freq == 0:
                     self.save_checkpoint()
