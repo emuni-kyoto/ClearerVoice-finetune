@@ -24,10 +24,15 @@ mkdir audio_datasets_emuni
 
 gcsfuse audio_datasets_emuni "$HOME/ClearerVoice-finetune/audio_datasets_emuni"
 
-# Install uv
+git config --global user.name "Shinnosuke Uesaka"
+
+git config --global user.email "shinnosuke.uesaka@gmail.com"
+
+
 curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
 uv venv
-uv pip install torch torchvision --torch-backend=cu124
+uv pip install torch torchvision torchaudio --torch-backend=cu124
 uv pip install -r requirements.txt
 
 
