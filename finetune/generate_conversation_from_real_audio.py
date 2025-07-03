@@ -34,8 +34,8 @@ Usage for testing:
       --output_dir ./real_conversation_data \
       --bucket_name audio_datasets_emuni \
       --prefix podcast/parquet_processed/train \
-      --num_conversations 10 \ 
-      --sample_rate 8000 --max_samples 10
+      --num_conversations 10 \
+        --max_samples 10
 
 Optional flags:
     --streaming: Enable streaming mode for processing (experimental)
@@ -241,12 +241,111 @@ def download_parquet_from_gcs(gcs_path: str, logger: logging.Logger) -> str:
         raise
 
 
+def extract_segment_timestamps(audio_path: str, sample_rate: int, 
+                              use_vad: bool = True,
+                              target_duration: float = 30.0,
+                              logger: logging.Logger = None) -> List[Tuple[float, float]]:
+    """Extract segment timestamps without loading the full segments into memory.
+    
+    Returns list of (start_time, end_time) in seconds.
+    """
+    if logger is None:
+        logger = logging.getLogger('real_conversation_generator')
+        
+    try:
+        # Load audio temporarily just for segmentation
+        audio, orig_sr = load_audio_from_path(audio_path, logger)
+        
+        # Resample if needed
+        if orig_sr != sample_rate:
+            audio = resample_audio(audio, orig_sr, sample_rate)
+            
+        # Get segment sample indices
+        target_accumulated = target_duration * 2.0  # Process 2x the target conversation duration
+        
+        if use_vad:
+            # Get speech segments
+            speech_segments = detect_speech_segments(audio, sample_rate, logger=logger)
+            
+            if not speech_segments:
+                # Fall back to random segmentation
+                segments = []
+                audio_duration = len(audio) / sample_rate
+                if audio_duration >= 1.0:
+                    current_pos = 0
+                    while current_pos < len(audio):
+                        segment_duration = random.uniform(1.0, 5.0)
+                        segment_samples = int(segment_duration * sample_rate)
+                        end_pos = min(current_pos + segment_samples, len(audio))
+                        if (end_pos - current_pos) / sample_rate >= 1.0:
+                            segments.append((current_pos / sample_rate, end_pos / sample_rate))
+                        current_pos = end_pos + int(random.uniform(0.1, 0.5) * sample_rate)
+            else:
+                # Convert speech segments to timestamps
+                segments = []
+                accumulated_duration = 0.0
+                for start, end in speech_segments:
+                    if target_accumulated and accumulated_duration >= target_accumulated:
+                        break
+                    segment_duration = (end - start) / sample_rate
+                    if segment_duration >= 1.0:
+                        if segment_duration > 5.0:
+                            # Split long segments
+                            num_splits = int(segment_duration / 5.0) + 1
+                            split_duration = segment_duration / num_splits
+                            for i in range(num_splits):
+                                split_start = start / sample_rate + i * split_duration
+                                split_end = start / sample_rate + (i + 1) * split_duration
+                                if split_end - split_start >= 1.0:
+                                    segments.append((split_start, split_end))
+                                    accumulated_duration += split_end - split_start
+                                    if target_accumulated and accumulated_duration >= target_accumulated:
+                                        break
+                        else:
+                            segments.append((start / sample_rate, end / sample_rate))
+                            accumulated_duration += segment_duration
+        else:
+            # Random segmentation
+            segments = []
+            audio_duration = len(audio) / sample_rate
+            accumulated_duration = 0.0
+            current_pos = 0
+            
+            while current_pos < len(audio) and accumulated_duration < target_accumulated:
+                segment_duration = random.uniform(1.0, 5.0)
+                segment_samples = int(segment_duration * sample_rate)
+                end_pos = min(current_pos + segment_samples, len(audio))
+                
+                if (end_pos - current_pos) / sample_rate >= 1.0:
+                    segments.append((current_pos / sample_rate, end_pos / sample_rate))
+                    accumulated_duration += (end_pos - current_pos) / sample_rate
+                
+                current_pos = end_pos + int(random.uniform(0.1, 0.5) * sample_rate)
+        
+        # Extract embedding from first 30 seconds
+        embedding_audio = audio[:int(30 * sample_rate)]
+        embedding = extract_speaker_embedding(embedding_audio, sample_rate, logger)
+        
+        # Clean up audio from memory
+        del audio
+        gc.collect()
+        
+        return segments, embedding.tolist()  # Convert to list for JSON serialization
+        
+    except Exception as e:
+        logger.warning(f"Failed to extract segments from {audio_path}: {e}")
+        return [], np.random.randn(32).tolist()
+
+
 def load_single_speaker_dataset(parquet_files: List[str], 
                                max_samples: int = 1000,
+                               target_sample_rate: int = 8000,
+                               use_vad: bool = True,
                                logger: logging.Logger = None) -> datasets.Dataset:
-    """Load samples from parquet files that contain only single speakers using HuggingFace datasets.
+    """Load samples from parquet files and extract segment timestamps using HuggingFace datasets.
     
-    Loads files one by one until we have sufficient samples, avoiding unnecessary downloads.
+    This version uses map functions to process audio files lazily and only stores
+    segment timestamps instead of full audio data.
     """
     
     if logger is None:
@@ -254,7 +353,6 @@ def load_single_speaker_dataset(parquet_files: List[str],
     
     logger.info(f"Found {len(parquet_files)} parquet files available")
     logger.info(f"Will load files until we collect {max_samples} single-speaker samples")
-    logger.info("Note: May not need to load all files if target is reached early")
     
     all_samples = []
     total_samples_loaded = 0
@@ -264,9 +362,7 @@ def load_single_speaker_dataset(parquet_files: List[str],
     shuffled_files = parquet_files.copy()
     random.shuffle(shuffled_files)
     
-    # Process files one by one
-    # Use manual progress bar since we don't know exactly how many files we'll need
-    pbar = tqdm(desc="Loading parquet files", unit="files")
+    pbar = tqdm(desc="Processing parquet files", unit="files")
     
     for file_idx, parquet_file in enumerate(shuffled_files):
         try:
@@ -284,7 +380,7 @@ def load_single_speaker_dataset(parquet_files: List[str],
                 'parquet',
                 data_files=local_parquet_path,
                 split='train',
-                streaming=False  # Load individual file into memory
+                streaming=False
             )
             
             # Filter for single speaker samples
@@ -302,44 +398,64 @@ def load_single_speaker_dataset(parquet_files: List[str],
                     single_speaker_data = single_speaker_data.select(range(samples_needed))
                     logger.debug(f"Taking only {samples_needed} samples from {parquet_file}")
                 
-                # Add source file info
-                def add_source_info(example):
-                    example['source_parquet'] = parquet_file
-                    # Extract a more meaningful speaker ID from the file path
-                    example['speaker_id'] = Path(parquet_file).stem
-                    return example
+                # Process samples to extract segment timestamps
+                def process_sample(example):
+                    # Extract segment timestamps and speaker embedding
+                    segments, embedding = extract_segment_timestamps(
+                        example['local_path'], 
+                        target_sample_rate,
+                        use_vad=use_vad,
+                        logger=logger
+                    )
+                    
+                    return {
+                        'audio_path': example['local_path'],
+                        'source_parquet': parquet_file,
+                        'speaker_id': example['local_path'],  # Use full path as unique ID
+                        'segment_timestamps': segments,
+                        'speaker_embedding': embedding,
+                        'num_segments': len(segments),
+                        'original_duration': example.get('duration', 0),
+                        'sample_rate': target_sample_rate
+                    }
                 
-                single_speaker_data = single_speaker_data.map(
-                    add_source_info,
-                    desc="Adding source info"
+                # Process samples with map function
+                processed_data = single_speaker_data.map(
+                    process_sample,
+                    desc="Extracting segment timestamps",
+                    remove_columns=single_speaker_data.column_names  # Remove original columns
                 )
                 
-                # Convert to list of dicts for accumulation
-                samples_from_file = list(single_speaker_data)
+                # Filter out samples with no segments
+                processed_data = processed_data.filter(
+                    lambda x: x['num_segments'] > 0
+                )
+                
+                # Convert to list for accumulation
+                samples_from_file = processed_data.to_list()
                 all_samples.extend(samples_from_file)
                 
                 samples_count = len(samples_from_file)
                 total_samples_loaded += samples_count
-                logger.debug(f"Found {samples_count} single-speaker samples in {parquet_file}")
+                logger.debug(f"Processed {samples_count} samples with segments from {parquet_file}")
             
             files_processed += 1
             pbar.update(1)
             pbar.set_postfix({
                 "loaded": f"{total_samples_loaded}/{max_samples} samples",
-                "files": files_processed,
-                "available": f"{len(shuffled_files)} total"
+                "files": files_processed
             })
             
             # Clean up temporary file
             try:
-                if 'local_parquet_path' in locals() and os.path.exists(local_parquet_path):
+                if os.path.exists(local_parquet_path):
                     os.remove(local_parquet_path)
                     logger.debug(f"Cleaned up temporary file: {local_parquet_path}")
             except Exception as cleanup_error:
                 logger.warning(f"Failed to clean up temporary file: {cleanup_error}")
             
         except Exception as e:
-            logger.warning(f"Failed to load {parquet_file}: {e}")
+            logger.warning(f"Failed to process {parquet_file}: {e}")
             pbar.update(1)
             # Clean up temporary file on error
             try:
@@ -352,14 +468,60 @@ def load_single_speaker_dataset(parquet_files: List[str],
     pbar.close()
     
     if not all_samples:
-        raise ValueError("No single-speaker samples found in the parquet files")
+        raise ValueError("No single-speaker samples with valid segments found in the parquet files")
     
     # Create final dataset from accumulated samples
     logger.info(f"Creating final dataset from {total_samples_loaded} samples")
     final_dataset = datasets.Dataset.from_list(all_samples)
     
-    logger.info(f"Loaded {len(final_dataset)} single-speaker samples from {files_processed} files")
+    logger.info(f"Loaded {len(final_dataset)} single-speaker samples with segment timestamps")
     return final_dataset
+
+
+def load_audio_segment_from_path(audio_path: str, start_time: float, end_time: float, 
+                                target_sample_rate: int, logger: logging.Logger, 
+                                bucket_name: str = None) -> np.ndarray:
+    """Load a specific segment of audio from a file.
+    
+    Args:
+        audio_path: Path to audio file (GCS or local)
+        start_time: Start time in seconds
+        end_time: End time in seconds
+        target_sample_rate: Target sample rate for output
+        logger: Logger instance
+        bucket_name: GCS bucket name if applicable
+        
+    Returns:
+        Audio segment as numpy array
+    """
+    try:
+        # First load the full audio
+        audio, sample_rate = load_audio_from_path(audio_path, logger, bucket_name)
+        
+        # Resample if needed
+        if sample_rate != target_sample_rate:
+            audio = resample_audio(audio, sample_rate, target_sample_rate)
+            sample_rate = target_sample_rate
+            
+        # Extract segment
+        start_sample = int(start_time * sample_rate)
+        end_sample = int(end_time * sample_rate)
+        
+        # Ensure we don't go out of bounds
+        start_sample = max(0, start_sample)
+        end_sample = min(len(audio), end_sample)
+        
+        segment = audio[start_sample:end_sample]
+        
+        # Clean up full audio
+        del audio
+        gc.collect()
+        
+        return segment
+        
+    except Exception as e:
+        logger.error(f"Failed to load audio segment from {audio_path} [{start_time:.2f}-{end_time:.2f}s]: {e}")
+        raise
 
 
 def load_audio_from_path(audio_path: str, logger: logging.Logger, bucket_name: str = None) -> Tuple[np.ndarray, int]:
@@ -662,20 +824,24 @@ def split_audio_into_segments(audio: np.ndarray, sample_rate: int,
     return final_segments
 
 
-def create_conversation_from_segments(speaker1_segments: List[np.ndarray],
-                                    speaker2_segments: List[np.ndarray],
-                                    sample_rate: int,
-                                    overlap_ratio: float = 0.2,  # Kept for backward compatibility, but not used
-                                    target_duration: float = 30.0,
-                                    logger: logging.Logger = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Create a conversation by interleaving segments from two speakers.
+def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict,
+                                       speaker1_timestamps: List[Tuple[float, float]],
+                                       speaker2_timestamps: List[Tuple[float, float]],
+                                       sample_rate: int,
+                                       output_paths: Dict[str, str],
+                                       target_duration: float = 30.0,
+                                       logger: logging.Logger = None) -> None:
+    """Create a conversation by loading segments on-demand and saving directly to disk.
     
-    Features:
-    - Natural turn-taking with random overlaps (0-3 seconds) between speakers
-    - Occasional pauses between turns (0-1 seconds)
-    - Short interjections during longer segments
-    - Ensures NO overlapping within each speaker's track
-    - Fills audio completely without silence at the end
+    Args:
+        speaker1_info: Dict with 'audio_path' and 'sample_rate' for speaker 1
+        speaker2_info: Dict with 'audio_path' and 'sample_rate' for speaker 2
+        speaker1_timestamps: List of (start_time, end_time) tuples for speaker 1 segments
+        speaker2_timestamps: List of (start_time, end_time) tuples for speaker 2 segments
+        sample_rate: Target sample rate
+        target_duration: Target duration in seconds
+        output_paths: Dict with 'mix', 's1', 's2' paths for output files
+        logger: Logger instance
     """
     
     if logger is None:
@@ -684,90 +850,74 @@ def create_conversation_from_segments(speaker1_segments: List[np.ndarray],
     # Maximum segment duration to avoid overly long monologues
     max_segment_duration = 8.0  # seconds
     
-    # Sort segments by duration to prioritize shorter ones
-    speaker1_segments = sorted(speaker1_segments, key=lambda seg: len(seg))
-    speaker2_segments = sorted(speaker2_segments, key=lambda seg: len(seg))
+    # Process timestamps to crop long segments
+    def crop_timestamps_if_needed(timestamps: List[Tuple[float, float]], max_duration: float) -> List[Tuple[float, float]]:
+        """Crop timestamps if segments exceed max duration."""
+        cropped_timestamps = []
+        for start, end in timestamps:
+            duration = end - start
+            if duration <= max_duration:
+                cropped_timestamps.append((start, end))
+            else:
+                # Split into multiple segments
+                num_splits = int(duration / max_duration) + 1
+                split_duration = duration / num_splits
+                for i in range(num_splits):
+                    split_start = start + i * split_duration
+                    split_end = start + (i + 1) * split_duration if i < num_splits - 1 else end
+                    if split_end - split_start >= 1.0:  # Only keep segments >= 1 second
+                        cropped_timestamps.append((split_start, split_end))
+        return cropped_timestamps
     
-    # Preprocess segments: crop if too long
-    def crop_segment_if_needed(segment: np.ndarray, max_duration: float) -> List[np.ndarray]:
-        """Crop segment if it exceeds max duration, return list of segments."""
-        segment_duration = len(segment) / sample_rate
-        if segment_duration <= max_duration:
-            return [segment]
-        
-        # Split into multiple segments
-        max_samples = int(max_duration * sample_rate)
-        segments = []
-        for i in range(0, len(segment), max_samples):
-            end = min(i + max_samples, len(segment))
-            if (end - i) / sample_rate >= 1.0:  # Only keep segments >= 1 second
-                segments.append(segment[i:end])
-        return segments
+    # Crop timestamps
+    speaker1_timestamps = crop_timestamps_if_needed(speaker1_timestamps, max_segment_duration)
+    speaker2_timestamps = crop_timestamps_if_needed(speaker2_timestamps, max_segment_duration)
     
-    # Crop all segments
-    speaker1_segments_cropped = []
-    for seg in speaker1_segments:
-        cropped = crop_segment_if_needed(seg, max_segment_duration)
-        if len(cropped) > 1:
-            logger.debug(f"Cropped speaker1 segment from {len(seg)/sample_rate:.2f}s into {len(cropped)} segments")
-        speaker1_segments_cropped.extend(cropped)
+    # Sort by duration to prioritize shorter ones  
+    speaker1_timestamps = sorted(speaker1_timestamps, key=lambda t: t[1] - t[0])
+    speaker2_timestamps = sorted(speaker2_timestamps, key=lambda t: t[1] - t[0])
     
-    speaker2_segments_cropped = []
-    for seg in speaker2_segments:
-        cropped = crop_segment_if_needed(seg, max_segment_duration)
-        if len(cropped) > 1:
-            logger.debug(f"Cropped speaker2 segment from {len(seg)/sample_rate:.2f}s into {len(cropped)} segments")
-        speaker2_segments_cropped.extend(cropped)
+    logger.info(f"After cropping: {len(speaker1_timestamps)} timestamps for speaker1, {len(speaker2_timestamps)} timestamps for speaker2")
     
-    speaker1_segments = speaker1_segments_cropped
-    speaker2_segments = speaker2_segments_cropped
-    
-    logger.info(f"After cropping: {len(speaker1_segments)} segments for speaker1, {len(speaker2_segments)} segments for speaker2")
-    
-    # All segments can be used for main utterances
-    speaker1_regular = speaker1_segments.copy()
-    speaker2_regular = speaker2_segments.copy()
-    
-    # Create interjection pools by trimming existing segments
-    def create_interjection_segments(segments, sample_rate, max_interjection_duration=1.0):
-        """Create short interjection segments by trimming existing segments."""
+    # Create interjection timestamps by trimming existing timestamps
+    def create_interjection_timestamps(timestamps: List[Tuple[float, float]], max_interjection_duration=1.0):
+        """Create short interjection timestamps by trimming existing timestamps."""
         interjections = []
-        for seg in segments:
-            duration = len(seg) / sample_rate
+        for start, end in timestamps:
+            duration = end - start
             if duration > 0.3:  # Only use segments longer than 0.3s
                 # Create interjection of 0.3-1.0 seconds
                 interjection_duration = min(duration, random.uniform(0.3, max_interjection_duration))
-                interjection_samples = int(interjection_duration * sample_rate)
                 
                 # Take from different parts of the segment for variety
                 if duration > interjection_duration * 2:
                     # Can take from beginning, middle, or end
                     position = random.choice(['start', 'middle', 'end'])
                     if position == 'start':
-                        interjection = seg[:interjection_samples]
+                        interjections.append((start, start + interjection_duration))
                     elif position == 'middle':
-                        mid_start = (len(seg) - interjection_samples) // 2
-                        interjection = seg[mid_start:mid_start + interjection_samples]
+                        mid_start = start + (duration - interjection_duration) / 2
+                        interjections.append((mid_start, mid_start + interjection_duration))
                     else:  # end
-                        interjection = seg[-interjection_samples:]
+                        interjections.append((end - interjection_duration, end))
                 else:
                     # Just take from beginning
-                    interjection = seg[:interjection_samples]
-                    
-                interjections.append(interjection)
+                    interjections.append((start, start + interjection_duration))
         
         # Shuffle interjections for variety
         random.shuffle(interjections)
         return interjections
     
     # Create interjection pools
-    speaker1_short = create_interjection_segments(speaker1_segments, sample_rate)
-    speaker2_short = create_interjection_segments(speaker2_segments, sample_rate)
+    speaker1_short = create_interjection_timestamps(speaker1_timestamps)
+    speaker2_short = create_interjection_timestamps(speaker2_timestamps)
     
-    logger.info(f"Created {len(speaker1_short)} interjections for speaker1, {len(speaker1_regular)} regular segments")
-    logger.info(f"Created {len(speaker2_short)} interjections for speaker2, {len(speaker2_regular)} regular segments")
+    logger.info(f"Created {len(speaker1_short)} interjections for speaker1, {len(speaker1_timestamps)} regular timestamps")
+    logger.info(f"Created {len(speaker2_short)} interjections for speaker2, {len(speaker2_timestamps)} regular timestamps")
     
-    # Shuffle regular segments
+    # Copy and shuffle timestamps for regular segments
+    speaker1_regular = speaker1_timestamps.copy()
+    speaker2_regular = speaker2_timestamps.copy()
     random.shuffle(speaker1_regular)
     random.shuffle(speaker2_regular)
     
@@ -797,22 +947,27 @@ def create_conversation_from_segments(speaker1_segments: List[np.ndarray],
     
     # Continue placing segments until we fill the duration
     while timeline_position < total_samples:
-        # Get next segment for current speaker
-        segment = None
+        # Get next timestamp for current speaker
+        timestamp = None
+        speaker_info = None
         if current_speaker == 1 and s1_idx < len(speaker1_regular):
-            segment = speaker1_regular[s1_idx]
+            timestamp = speaker1_regular[s1_idx]
+            speaker_info = speaker1_info
             s1_idx += 1
         elif current_speaker == 2 and s2_idx < len(speaker2_regular):
-            segment = speaker2_regular[s2_idx]
+            timestamp = speaker2_regular[s2_idx]
+            speaker_info = speaker2_info
             s2_idx += 1
         else:
             # Switch speaker and try again
             current_speaker = 2 if current_speaker == 1 else 1
             if current_speaker == 1 and s1_idx < len(speaker1_regular):
-                segment = speaker1_regular[s1_idx]
+                timestamp = speaker1_regular[s1_idx]
+                speaker_info = speaker1_info
                 s1_idx += 1
             elif current_speaker == 2 and s2_idx < len(speaker2_regular):
-                segment = speaker2_regular[s2_idx]
+                timestamp = speaker2_regular[s2_idx]
+                speaker_info = speaker2_info
                 s2_idx += 1
             else:
                 # Reset indices if we've used all segments
@@ -824,7 +979,21 @@ def create_conversation_from_segments(speaker1_segments: List[np.ndarray],
                     random.shuffle(speaker2_regular)
                 continue
         
-        if segment is None:
+        if timestamp is None:
+            continue
+            
+        # Load the segment on-demand
+        start_time, end_time = timestamp
+        try:
+            segment = load_audio_segment_from_path(
+                speaker_info['audio_path'],
+                start_time,
+                end_time,
+                sample_rate,
+                logger
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load segment [{start_time:.2f}-{end_time:.2f}s]: {e}")
             continue
         
         # Calculate where to place this segment
@@ -836,8 +1005,6 @@ def create_conversation_from_segments(speaker1_segments: List[np.ndarray],
             
         # Determine start position based on timeline and avoiding self-overlap
         if len(segments_placed) > 0:
-            last_segment = segments_placed[-1]
-            
             # 90% chance of overlap with other speaker, 10% chance of pause
             if random.random() < 0.9:
                 # Overlap: 0-3 seconds
@@ -862,7 +1029,8 @@ def create_conversation_from_segments(speaker1_segments: List[np.ndarray],
             break
             
         # Calculate end position
-        end_position = min(start_position + len(segment), total_samples)
+        segment_length = len(segment)
+        end_position = min(start_position + segment_length, total_samples)
         actual_length = end_position - start_position
         
         if actual_length <= 0:
@@ -919,15 +1087,32 @@ def create_conversation_from_segments(speaker1_segments: List[np.ndarray],
             # Add interjection from other speaker
             other_speaker = 2 if current_speaker == 1 else 1
             
-            # Get short segment for interjection
-            interjection = None
+            # Get short segment timestamp for interjection
+            interjection_timestamp = None
+            interjection_info = None
             if other_speaker == 1 and s1_short_idx < len(speaker1_short):
-                interjection = speaker1_short[s1_short_idx]
+                interjection_timestamp = speaker1_short[s1_short_idx]
+                interjection_info = speaker1_info
                 s1_short_idx += 1
             elif other_speaker == 2 and s2_short_idx < len(speaker2_short):
-                interjection = speaker2_short[s2_short_idx]
+                interjection_timestamp = speaker2_short[s2_short_idx]
+                interjection_info = speaker2_info
                 s2_short_idx += 1
                 
+            if interjection_timestamp is not None:
+                # Load interjection on-demand
+                try:
+                    interjection = load_audio_segment_from_path(
+                        interjection_info['audio_path'],
+                        interjection_timestamp[0],
+                        interjection_timestamp[1],
+                        sample_rate,
+                        logger
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to load interjection: {e}")
+                    interjection = None
+                    
             if interjection is not None:
                 # Place interjection in the middle of the main segment
                 # But ensure it doesn't overlap with other audio from the same speaker
@@ -995,26 +1180,44 @@ def create_conversation_from_segments(speaker1_segments: List[np.ndarray],
         fill_speaker = 1 if random.random() < 0.5 else 2
         
         while fill_position < total_samples - sample_rate * 0.5:  # Leave small silence at very end
-            # Get next segment
-            segment = None
+            # Get next timestamp
+            timestamp = None
+            speaker_info = None
             if fill_speaker == 1:
                 if s1_idx < len(speaker1_regular):
-                    segment = speaker1_regular[s1_idx]
+                    timestamp = speaker1_regular[s1_idx]
+                    speaker_info = speaker1_info
                     s1_idx += 1
                 elif s1_short_idx < len(speaker1_short):
-                    segment = speaker1_short[s1_short_idx]
+                    timestamp = speaker1_short[s1_short_idx]
+                    speaker_info = speaker1_info
                     s1_short_idx += 1
             else:
                 if s2_idx < len(speaker2_regular):
-                    segment = speaker2_regular[s2_idx]
+                    timestamp = speaker2_regular[s2_idx]
+                    speaker_info = speaker2_info
                     s2_idx += 1
                 elif s2_short_idx < len(speaker2_short):
-                    segment = speaker2_short[s2_short_idx]
+                    timestamp = speaker2_short[s2_short_idx]
+                    speaker_info = speaker2_info
                     s2_short_idx += 1
                     
-            if segment is None:
+            if timestamp is None:
                 # Try other speaker
                 fill_speaker = 2 if fill_speaker == 1 else 1
+                continue
+                
+            # Load segment on-demand
+            try:
+                segment = load_audio_segment_from_path(
+                    speaker_info['audio_path'],
+                    timestamp[0],
+                    timestamp[1],
+                    sample_rate,
+                    logger
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load fill segment: {e}")
                 continue
                 
             # Place segment
@@ -1075,7 +1278,27 @@ def create_conversation_from_segments(speaker1_segments: List[np.ndarray],
     logger.info(f"Conversation created: {len(segments_placed)} segments placed")
     logger.debug(f"Speaker1 last end: {speaker1_last_end:.2f}s, Speaker2 last end: {speaker2_last_end:.2f}s")
     
-    return mixed_audio, speaker1_audio, speaker2_audio
+    # Save audio files directly to disk
+    try:
+        sf.write(output_paths['mix'], mixed_audio, sample_rate)
+        sf.write(output_paths['s1'], speaker1_audio, sample_rate)
+        sf.write(output_paths['s2'], speaker2_audio, sample_rate)
+        
+        logger.info(f"Saved conversation to: {output_paths['mix']}")
+        
+        # Calculate and return duration for metadata
+        duration = len(mixed_audio) / sample_rate
+        return duration
+        
+    except Exception as e:
+        logger.error(f"Failed to save audio files: {e}")
+        raise
+    finally:
+        # Clean up memory
+        del mixed_audio
+        del speaker1_audio  
+        del speaker2_audio
+        gc.collect()
 
 
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -1123,9 +1346,15 @@ def generate_conversations_from_real_audio(output_dir: str,
         logger.error("No parquet files found")
         return
     
-    # Load single-speaker samples
+    # Load single-speaker samples with segment timestamps
     logger.info("Loading single-speaker samples from parquet files...")
-    samples_dataset = load_single_speaker_dataset(parquet_files, max_samples_to_load, logger)
+    samples_dataset = load_single_speaker_dataset(
+        parquet_files, 
+        max_samples_to_load, 
+        target_sample_rate,
+        use_vad,
+        logger
+    )
     
     # Create output directories
     output_path = Path(output_dir).absolute()
@@ -1141,129 +1370,52 @@ def generate_conversations_from_real_audio(output_dir: str,
     
     logger.info(f"Created output directories: {mix_dir}, {s1_dir}, {s2_dir}")
     
-    # Process audio files and create segment pool by speaker
-    logger.info("Processing audio files and creating segment pools by speaker...")
+    # Process dataset to filter by number of segments
+    logger.info("Filtering samples by number of segments...")
     
-    # Dictionary to store segments and embeddings by speaker (file source)
-    segments_by_speaker = {}
-    embeddings_by_speaker = {}
-    processed_files = 0
-    
-    # Process audio files in batches
-    batch_size = 10
-    min_speakers_needed = 2  # Need at least 2 different speakers
     min_segments_per_speaker = 5  # Minimum segments per speaker
     
-    # Process in batches for better memory management
-    total_samples = len(samples_dataset)
-    pbar = tqdm(desc="Processing audio files", unit="files")
+    # Filter samples with sufficient segments
+    valid_samples = samples_dataset.filter(
+        lambda x: x['num_segments'] >= min_segments_per_speaker,
+        desc="Filtering samples with sufficient segments"
+    )
     
-    # Process samples in batches
-    for i in range(0, total_samples, batch_size):
-        # Get batch of samples
-        end_idx = min(i + batch_size, total_samples)
-        batch = samples_dataset.select(range(i, end_idx))
-        
-        for sample in batch:
-            try:
-                # Create unique speaker ID based on file path
-                # Each file represents a different person, even if internal speaker_ids match
-                file_path = sample.get('local_path', '')
-                if file_path:
-                    # Use the full file path as unique identifier
-                    # e.g., /mnt/disks/podcast/audio_files_processed/ja/batch_id/file_id.wav
-                    # This ensures each file is treated as a different speaker
-                    speaker_id = file_path
-                else:
-                    # Fallback to using processed file counter
-                    speaker_id = f'file_{processed_files}'
-                
-                # Load audio
-                logger.debug(f"Loading audio for speaker {speaker_id} from: {sample['local_path']}")
-                audio, sample_rate = load_audio_from_path(sample['local_path'], logger, bucket_name=bucket_name)
-                
-                # Resample to target rate
-                if sample_rate != target_sample_rate:
-                    audio = resample_audio(audio, sample_rate, target_sample_rate)
-                
-                # Extract speaker embedding from the audio (use first 30 seconds for consistency)
-                embedding_audio = audio[:int(30 * target_sample_rate)]  # Use up to 30 seconds
-                speaker_embedding = extract_speaker_embedding(embedding_audio, target_sample_rate, logger)
-                
-                # Split into segments - only process enough audio for ~2x target conversation duration
-                # This avoids processing very long audio files unnecessarily
-                target_accumulated = target_duration * 2.0  # Process 2x the target conversation duration
-                segments = split_audio_into_segments(audio, target_sample_rate, logger=logger, use_vad=use_vad, 
-                                                   target_accumulated_duration=target_accumulated)
-                
-                if segments:
-                    if speaker_id not in segments_by_speaker:
-                        segments_by_speaker[speaker_id] = []
-                        embeddings_by_speaker[speaker_id] = speaker_embedding
-                    segments_by_speaker[speaker_id].extend(segments)
-                    processed_files += 1
-                
-                pbar.update(1)
-                pbar.set_postfix({
-                    "processed": processed_files, 
-                    "speakers": len(segments_by_speaker),
-                    "segments": sum(len(segs) for segs in segments_by_speaker.values()),
-                    "total_files": total_samples
-                })
-                
-            except Exception as e:
-                logger.warning(f"Failed to process audio file: {e}")
-                pbar.update(1)
-                continue
-        
-        # Clean up memory after each batch
-        gc.collect()
-        
-        # Check if we have enough speakers with enough segments
-        valid_speakers = [spk for spk, segs in segments_by_speaker.items() 
-                         if len(segs) >= min_segments_per_speaker]
-        
-        if len(valid_speakers) >= min_speakers_needed:
-            # Check if we have enough total segments for conversations
-            total_segments = sum(len(segments_by_speaker[spk]) for spk in valid_speakers)
-            if total_segments >= num_conversations * 10:  # ~10 segments per conversation minimum
-                pbar.set_description("Processing audio files [COMPLETE - target reached]")
-                logger.info(f"✓ Collected enough data: {len(valid_speakers)} audio files, {total_segments} total segments")
-                logger.info(f"  Processed {i + batch_size} out of {total_samples} files")
-                break
+    logger.info(f"Found {len(valid_samples)} samples with at least {min_segments_per_speaker} segments")
     
-    pbar.close()
-    
-    # Filter out speakers with too few segments
-    valid_speakers = {spk: segs for spk, segs in segments_by_speaker.items() 
-                     if len(segs) >= min_segments_per_speaker}
-    
-    logger.info(f"Processed {processed_files} audio files, found {len(valid_speakers)} files with sufficient segments")
-    
-    # Log speaker statistics
-    for speaker_id, segments in list(valid_speakers.items())[:5]:  # Show first 5 speakers
-        speaker_name = Path(speaker_id).name if '/' in speaker_id else speaker_id
-        logger.info(f"  File '{speaker_name}': {len(segments)} segments")
-    if len(valid_speakers) > 5:
-        logger.info(f"  ... and {len(valid_speakers) - 5} more files")
-    
-    if len(valid_speakers) < 2:
-        logger.error(f"Not enough audio files with sufficient segments. Found {len(valid_speakers)}, need at least 2")
+    if len(valid_samples) < 2:
+        logger.error(f"Not enough audio files with sufficient segments. Found {len(valid_samples)}, need at least 2")
         logger.error("Each audio file must have at least 5 speech segments to be used")
         return
     
-    total_segments = sum(len(segs) for segs in valid_speakers.values())
-    if total_segments < num_conversations * 4:  # Need at least 4 segments per conversation
+    # Extract embeddings for similarity computation
+    embeddings_by_speaker = {}
+    for sample in valid_samples:
+        speaker_id = sample['speaker_id']
+        embeddings_by_speaker[speaker_id] = np.array(sample['speaker_embedding'])
+    
+    # Check total available segments
+    total_segments = sum(sample['num_segments'] for sample in valid_samples)
+    if total_segments < num_conversations * 4:
         logger.error(f"Not enough segments to create requested number of conversations. Have {total_segments}, need at least {num_conversations * 4}")
         return
+    
+    # Log speaker statistics
+    for i, sample in enumerate(valid_samples):
+        if i >= 5:  # Show first 5 speakers
+            logger.info(f"  ... and {len(valid_samples) - 5} more files")
+            break
+        speaker_name = Path(sample['speaker_id']).name if '/' in sample['speaker_id'] else sample['speaker_id']
+        logger.info(f"  File '{speaker_name}': {sample['num_segments']} segments")
     
     # Generate conversations
     all_data = []
     successful_generations = 0
     failed_generations = 0
     
-    # Convert speaker dict to list for easier sampling
-    speaker_list = list(valid_speakers.keys())
+    # Convert to list for easier sampling
+    speaker_list = [s['speaker_id'] for s in valid_samples]
+    valid_samples_dict = {s['speaker_id']: s for s in valid_samples}
     
     # Pre-compute similarity matrix for efficient speaker pair selection
     logger.info("Computing speaker similarity matrix...")
@@ -1361,72 +1513,57 @@ def generate_conversations_from_real_audio(output_dir: str,
                 # Remove oldest pair (convert to list, remove first, convert back)
                 used_pairs = set(list(used_pairs)[1:])
             
-            speaker1_segments = valid_speakers[speaker1_id]
-            speaker2_segments = valid_speakers[speaker2_id]
+            # Get speaker data
+            speaker1_data = valid_samples_dict[speaker1_id]
+            speaker2_data = valid_samples_dict[speaker2_id]
             
-            # Select random segments for this conversation from each speaker
-            num_segments_per_speaker = min(10, min(len(speaker1_segments), len(speaker2_segments)) // 2)
+            speaker1_timestamps = speaker1_data['segment_timestamps']
+            speaker2_timestamps = speaker2_data['segment_timestamps']
+            
+            # Select random timestamps for this conversation from each speaker
+            num_segments_per_speaker = min(10, min(len(speaker1_timestamps), len(speaker2_timestamps)) // 2)
             num_segments_per_speaker = max(2, num_segments_per_speaker)  # At least 2 segments per speaker
             
-            s1_segments = random.sample(speaker1_segments, num_segments_per_speaker)
-            s2_segments = random.sample(speaker2_segments, num_segments_per_speaker)
+            s1_timestamps = random.sample(speaker1_timestamps, num_segments_per_speaker)
+            s2_timestamps = random.sample(speaker2_timestamps, num_segments_per_speaker)
             
             # Extract just the filename for cleaner logging
             speaker1_name = Path(speaker1_id).name if '/' in speaker1_id else speaker1_id
             speaker2_name = Path(speaker2_id).name if '/' in speaker2_id else speaker2_id
             logger.info(f"Conversation {i}: {speaker1_name} vs {speaker2_name}")
-            logger.debug(f"Using {len(s1_segments)} segments from speaker1, {len(s2_segments)} segments from speaker2")
+            logger.debug(f"Using {len(s1_timestamps)} timestamps from speaker1, {len(s2_timestamps)} timestamps from speaker2")
             
-            # Validate segments
-            if not s1_segments or not s2_segments:
-                logger.error(f"No segments available for conversation {i}")
+            # Validate timestamps
+            if not s1_timestamps or not s2_timestamps:
+                logger.error(f"No timestamps available for conversation {i}")
                 failed_generations += 1
                 continue
                 
-            # Create conversation
-            mixed, speaker1, speaker2 = create_conversation_from_segments(
-                s1_segments, s2_segments, target_sample_rate,
-                overlap_ratio=0.2, target_duration=target_duration, logger=logger
+            # Create conversation output paths
+            conversation_id = f"conversation_{i:04d}"
+            output_paths = {
+                'mix': str((mix_dir / f"{conversation_id}_mix.wav").absolute()),
+                's1': str((s1_dir / f"{conversation_id}_s1.wav").absolute()),
+                's2': str((s2_dir / f"{conversation_id}_s2.wav").absolute())
+            }
+            
+            # Create conversation (loading segments on-demand and saving to disk)
+            duration = create_conversation_from_timestamps(
+                speaker1_data, speaker2_data,
+                s1_timestamps, s2_timestamps,
+                target_sample_rate,
+                output_paths,
+                target_duration=target_duration,
+                logger=logger
             )
             
-            # Validate audio data
-            for audio_name, audio_data in [("mixed", mixed), ("speaker1", speaker1), ("speaker2", speaker2)]:
-                if audio_data is None:
-                    raise ValueError(f"{audio_name} audio is None")
-                if len(audio_data) == 0:
-                    raise ValueError(f"{audio_name} audio is empty")
-                if np.any(np.isnan(audio_data)):
-                    raise ValueError(f"{audio_name} audio contains NaN values")
-                if np.any(np.isinf(audio_data)):
-                    raise ValueError(f"{audio_name} audio contains Inf values")
-                logger.debug(f"{audio_name} audio: shape={audio_data.shape}, dtype={audio_data.dtype}, range=[{audio_data.min():.3f}, {audio_data.max():.3f}]")
-            
-            # Save audio files
-            conversation_id = f"conversation_{i:04d}"
-            mix_file = (mix_dir / f"{conversation_id}_mix.wav").absolute()
-            s1_file = (s1_dir / f"{conversation_id}_s1.wav").absolute()
-            s2_file = (s2_dir / f"{conversation_id}_s2.wav").absolute()
-            
-            # Ensure directories exist before writing
-            mix_file.parent.mkdir(parents=True, exist_ok=True)
-            s1_file.parent.mkdir(parents=True, exist_ok=True)
-            s2_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Debug logging
-            logger.debug(f"Writing to: {mix_file}")
-            
-            sf.write(str(mix_file), mixed, target_sample_rate)
-            sf.write(str(s1_file), speaker1, target_sample_rate)
-            sf.write(str(s2_file), speaker2, target_sample_rate)
-            
-            duration = len(mixed) / target_sample_rate
-            logger.debug(f"Saved conversation {i:04d} (duration: {duration:.2f}s)")
+            logger.debug(f"Generated conversation {i:04d} (duration: {duration:.2f}s)")
             
             # Add to data list
             all_data.append({
-                "mix_path": str(mix_file),
-                "s1_path": str(s1_file),
-                "s2_path": str(s2_file),
+                "mix_path": output_paths['mix'],
+                "s1_path": output_paths['s1'],
+                "s2_path": output_paths['s2'],
                 "duration": duration
             })
             
@@ -1490,6 +1627,14 @@ def generate_conversations_from_real_audio(output_dir: str,
     
     with open(output_path / "metadata.json", 'w') as f:
         json.dump(metadata, f, indent=2)
+    
+    # Clean up HuggingFace datasets to free memory
+    logger.info("Cleaning up datasets and freeing memory...")
+    del samples_dataset
+    del valid_samples
+    del embeddings_by_speaker
+    del similarity_matrix
+    gc.collect()
     
     logger.info("Dataset generation completed successfully")
 
