@@ -16,15 +16,28 @@ gcloud compute instances create clearervoice-train \
 # SSH into instance
 gcloud compute ssh clearervoice-train --zone=us-central1-a
 
-# Clone this repository
-git clone https://github.com/YOUR_ORG/ClearerVoice-finetune.git
-cd ClearerVoice-finetune
+sudo apt-get install git-lfs
 
-# Run one-time setup
-bash finetune/setup_env.sh
+git clone https://github.com/emuni-kyoto/ClearerVoice-finetune.git
+cd ClearerVoice-finetune
+mkdir audio_datasets_emuni
+
+gcsfuse audio_datasets_emuni "$HOME/ClearerVoice-finetune/audio_datasets_emuni"
+
+git config --global user.name "Shinnosuke Uesaka"
+
+git config --global user.email "shinnosuke.uesaka@gmail.com"
+
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+uv venv
+uv pip install torch torchvision torchaudio --torch-backend=cu124
+uv pip install -r requirements.txt
+
+
 
 # Set your API keys
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 export GOOGLE_API_KEY="your-gemini-api-key"
 
 # Optional: Set wandb key for experiment tracking
