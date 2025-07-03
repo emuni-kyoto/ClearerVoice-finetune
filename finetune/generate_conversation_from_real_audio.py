@@ -21,12 +21,12 @@ Features:
 
 Usage:
     python generate_conversation_from_real_audio.py \
-        --output_dir ./real_conversation_data \
+        --output_dir /home/shinnosukeuesaka/ClearerVoice-finetune/audio_datasets_emuni/audio_separation_data/3000_samples \
         --bucket_name audio_datasets_emuni \
         --prefix podcast/parquet_processed/train \
-        --num_conversations 100 \
+        --num_conversations 3000 \
         --sample_rate 8000 \
-        --max_samples 1000 \
+        --max_samples 3000 \
         --hard_sample_percentage 0.3
     
 Usage for testing:
