@@ -433,7 +433,7 @@ def load_single_speaker_dataset(parquet_files: List[str],
     shuffled_files = parquet_files.copy()
     random.shuffle(shuffled_files)
     
-    pbar = tqdm(desc="Processing parquet files", unit="files")
+    pbar = tqdm(total=max_samples, desc="Loading samples", unit="samples")
     
     for file_idx, parquet_file in enumerate(shuffled_files):
         try:
@@ -511,13 +511,14 @@ def load_single_speaker_dataset(parquet_files: List[str],
                 samples_count = len(samples_from_file)
                 total_samples_loaded += samples_count
                 logger.debug(f"Processed {samples_count} samples with segments from {parquet_file}")
+                
+                # Update progress bar with new samples loaded
+                pbar.update(samples_count)
+                pbar.set_postfix({
+                    "files": files_processed + 1
+                })
             
             files_processed += 1
-            pbar.update(1)
-            pbar.set_postfix({
-                "loaded": f"{total_samples_loaded}/{max_samples} samples",
-                "files": files_processed
-            })
             
             # Clean up temporary file
             try:
@@ -529,7 +530,6 @@ def load_single_speaker_dataset(parquet_files: List[str],
             
         except Exception as e:
             logger.warning(f"Failed to process {parquet_file}: {e}")
-            pbar.update(1)
             # Clean up temporary file on error
             try:
                 if 'local_parquet_path' in locals() and os.path.exists(local_parquet_path):
@@ -1342,7 +1342,7 @@ def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict
                 if interjection_key in all_segments:
                     interjection = all_segments[interjection_key]
                 else:
-                    logger.warning(f"Interjection not found in pre-loaded segments")
+                    logger.warning("Interjection not found in pre-loaded segments")
                     interjection = None
                     
             if interjection is not None:
@@ -1443,7 +1443,7 @@ def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict
             segment_key = (speaker_info['audio_path'], timestamp)
             
             if segment_key not in all_segments:
-                logger.warning(f"Fill segment not found in pre-loaded segments")
+                logger.warning("Fill segment not found in pre-loaded segments")
                 continue
                 
             segment = all_segments[segment_key]
