@@ -7,7 +7,10 @@ This script:
 3. Handles audio paths: GCS URLs (gs://...), mount paths (/mnt/disks/...), and local paths
 4. Extracts lightweight speaker embeddings using MFCC-based features
 5. Selects samples with only one speaker
-6. Splits audio from different speakers into segments based on pauses or randomly
+6. Splits audio from different speakers into segments based on:
+   - Word timestamps and pauses (if available in parquet)
+   - VAD-based pause detection (fallback)
+   - Random segmentation (when --no-vad flag is used)
 7. Creates synthetic conversations by overlapping segments from different speakers
 8. Supports hard/easy sample generation based on speaker similarity
 9. Saves in ClearerVoice format for finetuning
@@ -42,6 +45,7 @@ Optional flags:
     --max_samples: Maximum number of single-speaker samples to load (default: 1000)
     --no-vad: Disable VAD and use random segmentation (useful when VAD fails)
     --hard_sample_percentage: Percentage of hard samples with similar speakers (0.0-1.0, default: 0.3)
+    --pause_threshold: Minimum pause duration in seconds to split segments when using word timestamps (default: 0.5)
 
 Note: Audio files from GCS are cached locally in /tmp/audio_downloads/ for efficiency.
 """
@@ -243,11 +247,29 @@ def download_parquet_from_gcs(gcs_path: str, logger: logging.Logger) -> str:
 
 def extract_segment_timestamps(audio_path: str, sample_rate: int, 
                               use_vad: bool = True,
+                              pause_threshold: float = 0.5,
+                              word_alignments: List[Dict] = None,
                               target_duration: float = 30.0,
                               logger: logging.Logger = None) -> List[Tuple[float, float]]:
     """Extract segment timestamps without loading the full segments into memory.
     
-    Returns list of (start_time, end_time) in seconds.
+    Can use either word timestamps (if provided) or VAD-based segmentation.
+    When word_alignments is provided, segments are created by detecting pauses
+    between words that exceed pause_threshold.
+    
+    Args:
+        audio_path: Path to audio file
+        sample_rate: Target sample rate
+        use_vad: Whether to use VAD (ignored if word_alignments provided)
+        pause_threshold: Minimum pause duration to split segments (seconds)
+        word_alignments: List of word timestamp dicts with 'start', 'end', 'text' keys
+        target_duration: Target accumulated duration (seconds)
+        logger: Logger instance
+        
+    Returns:
+        Tuple of (segments, embedding) where:
+        - segments: List of (start_time, end_time) tuples in seconds
+        - embedding: Speaker embedding as list of floats
     """
     if logger is None:
         logger = logging.getLogger('real_conversation_generator')
@@ -263,7 +285,55 @@ def extract_segment_timestamps(audio_path: str, sample_rate: int,
         # Get segment sample indices
         target_accumulated = target_duration * 2.0  # Process 2x the target conversation duration
         
-        if use_vad:
+        # If word alignments are provided, use them instead of VAD
+        if word_alignments is not None and len(word_alignments) > 0:
+            logger.info(f"Using word timestamps for segmentation ({len(word_alignments)} words)")
+            # Get speech segments from word timestamps
+            speech_segments = detect_segments_from_word_timestamps(
+                word_alignments,
+                sample_rate,
+                pause_threshold=pause_threshold,
+                logger=logger
+            )
+            
+            if not speech_segments:
+                # Fall back to random segmentation
+                segments = []
+                audio_duration = len(audio) / sample_rate
+                if audio_duration >= 1.0:
+                    current_pos = 0
+                    while current_pos < len(audio):
+                        segment_duration = random.uniform(1.0, 5.0)
+                        segment_samples = int(segment_duration * sample_rate)
+                        end_pos = min(current_pos + segment_samples, len(audio))
+                        if (end_pos - current_pos) / sample_rate >= 1.0:
+                            segments.append((current_pos / sample_rate, end_pos / sample_rate))
+                        current_pos = end_pos + int(random.uniform(0.1, 0.5) * sample_rate)
+            else:
+                # Convert speech segments to timestamps
+                segments = []
+                accumulated_duration = 0.0
+                for start, end in speech_segments:
+                    if target_accumulated and accumulated_duration >= target_accumulated:
+                        break
+                    segment_duration = (end - start) / sample_rate
+                    if segment_duration >= 1.0:
+                        if segment_duration > 5.0:
+                            # Split long segments
+                            num_splits = int(segment_duration / 5.0) + 1
+                            split_duration = segment_duration / num_splits
+                            for i in range(num_splits):
+                                split_start = start / sample_rate + i * split_duration
+                                split_end = start / sample_rate + (i + 1) * split_duration
+                                if split_end - split_start >= 1.0:
+                                    segments.append((split_start, split_end))
+                                    accumulated_duration += split_end - split_start
+                                    if target_accumulated and accumulated_duration >= target_accumulated:
+                                        break
+                        else:
+                            segments.append((start / sample_rate, end / sample_rate))
+                            accumulated_duration += segment_duration
+        elif use_vad:
             # Get speech segments
             speech_segments = detect_speech_segments(audio, sample_rate, logger=logger)
             
@@ -341,6 +411,7 @@ def load_single_speaker_dataset(parquet_files: List[str],
                                max_samples: int = 1000,
                                target_sample_rate: int = 8000,
                                use_vad: bool = True,
+                               pause_threshold: float = 0.5,
                                logger: logging.Logger = None) -> datasets.Dataset:
     """Load samples from parquet files and extract segment timestamps using HuggingFace datasets.
     
@@ -405,6 +476,8 @@ def load_single_speaker_dataset(parquet_files: List[str],
                         example['local_path'], 
                         target_sample_rate,
                         use_vad=use_vad,
+                        pause_threshold=pause_threshold,
+                        word_alignments=example.get('word_speech_alignment', None),
                         logger=logger
                     )
                     
@@ -535,17 +608,28 @@ def load_audio_from_path(audio_path: str, logger: logging.Logger, bucket_name: s
             bucket_name = parts[0]
             blob_name = parts[1] if len(parts) > 1 else ''
             
-            # Download to temporary file
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_name)
+            # Create cache directory structure that mirrors the GCS structure
+            temp_dir = Path("/tmp/audio_downloads") / bucket_name
+            temp_path = temp_dir / blob_name
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
             
-            temp_path = f"/tmp/{Path(blob_name).name}"
-            blob.download_to_filename(temp_path)
-            
-            # Load audio from temp file
-            audio_file = temp_path
-            cleanup_temp = True
+            # Check if file is already cached
+            if temp_path.exists():
+                logger.info(f"Using cached audio file for GCS: gs://{bucket_name}/{blob_name} -> {temp_path}")
+                audio_file = str(temp_path)
+                cleanup_temp = False
+            else:
+                # Download from GCS
+                client = storage.Client()
+                bucket = client.bucket(bucket_name)
+                blob = bucket.blob(blob_name)
+                
+                logger.info(f"Downloading from GCS: gs://{bucket_name}/{blob_name} to {temp_path}")
+                blob.download_to_filename(str(temp_path))
+                
+                # Load audio from temp file
+                audio_file = str(temp_path)
+                cleanup_temp = False  # Don't cleanup cached files
         elif audio_path.startswith('/mnt/disks/podcast/'):
             # This is a mount path from the processing environment
             # Convert to GCS path and download
@@ -563,25 +647,25 @@ def load_audio_from_path(audio_path: str, logger: logging.Logger, bucket_name: s
             # Use audio_datasets_emuni bucket
             bucket_name = 'audio_datasets_emuni'
             
-            logger.info(f"Converting mount path to GCS: {audio_path} -> gs://{bucket_name}/{relative_path}")
+            # Create temp directory structure that mirrors the GCS structure for caching
+            temp_dir = Path("/tmp/audio_downloads") / bucket_name
+            temp_path = temp_dir / relative_path
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Download from GCS
-            try:
-                client = storage.Client()
-                bucket = client.bucket(bucket_name)
-                blob = bucket.blob(relative_path)
+            # Check if file is already cached
+            if temp_path.exists():
+                logger.info(f"Using cached audio file for mount path: {audio_path} -> {temp_path}")
+            else:
+                logger.info(f"Converting mount path to GCS: {audio_path} -> gs://{bucket_name}/{relative_path}")
                 
-                # Create temp directory structure that mirrors the GCS structure for caching
-                temp_dir = Path("/tmp/audio_downloads") / bucket_name
-                temp_path = temp_dir / relative_path
-                temp_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                # Check if file is already cached
-                if temp_path.exists():
-                    logger.debug(f"Using cached audio file: {temp_path}")
-                else:
+                # Download from GCS
+                try:
+                    client = storage.Client()
+                    bucket = client.bucket(bucket_name)
+                    blob = bucket.blob(relative_path)
+                    
                     # Try to download the file
-                    logger.debug(f"Downloading from GCS: gs://{bucket_name}/{relative_path} to {temp_path}")
+                    logger.info(f"Downloading from GCS: gs://{bucket_name}/{relative_path} to {temp_path}")
                     try:
                         blob.download_to_filename(str(temp_path))
                         logger.debug("Successfully downloaded audio file")
@@ -589,11 +673,11 @@ def load_audio_from_path(audio_path: str, logger: logging.Logger, bucket_name: s
                         if temp_path.exists():
                             temp_path.unlink()  # Remove partial download
                         raise FileNotFoundError(f"File not found in GCS: gs://{bucket_name}/{relative_path}") from download_error
-            except Exception as e:
-                logger.error(f"Failed to access GCS file: {e}")
-                logger.error("Make sure you have Google Cloud credentials configured")
-                logger.error("Run: gcloud auth application-default login")
-                raise
+                except Exception as e:
+                    logger.error(f"Failed to access GCS file: {e}")
+                    logger.error("Make sure you have Google Cloud credentials configured")
+                    logger.error("Run: gcloud auth application-default login")
+                    raise
             
             # Load audio from temp file
             audio_file = str(temp_path)
@@ -626,6 +710,83 @@ def load_audio_from_path(audio_path: str, logger: logging.Logger, bucket_name: s
     except Exception as e:
         logger.error(f"Failed to load audio from {audio_path}: {e}")
         raise
+
+
+def detect_segments_from_word_timestamps(word_alignments: List[Dict], 
+                                        sample_rate: int,
+                                        pause_threshold: float = 0.5,
+                                        min_segment_duration: float = 1.0,
+                                        max_segment_duration: float = 10.0,
+                                        logger: logging.Logger = None) -> List[Tuple[int, int]]:
+    """Detect speech segments from word timestamps by finding pauses.
+    
+    Args:
+        word_alignments: List of word alignment dicts with 'start', 'end', 'text' keys
+        sample_rate: Sample rate of the audio
+        pause_threshold: Minimum pause duration in seconds to split segments
+        min_segment_duration: Minimum segment duration in seconds
+        max_segment_duration: Maximum segment duration in seconds
+        logger: Logger instance
+        
+    Returns:
+        List of (start_sample, end_sample) tuples
+    """
+    if logger is None:
+        logger = logging.getLogger('real_conversation_generator')
+        
+    if not word_alignments:
+        logger.warning("No word alignments provided")
+        return []
+        
+    # Sort word alignments by start time
+    sorted_words = sorted(word_alignments, key=lambda x: x.get('start', 0))
+    
+    segments = []
+    current_segment_start = None
+    current_segment_end = None
+    
+    for i, word in enumerate(sorted_words):
+        word_start = word.get('start', 0)
+        word_end = word.get('end', word_start)
+        
+        # Skip invalid word timestamps
+        if word_start < 0 or word_end < word_start:
+            continue
+            
+        if current_segment_start is None:
+            # Start first segment
+            current_segment_start = word_start
+            current_segment_end = word_end
+        else:
+            # Check pause between previous word and current word
+            pause_duration = word_start - current_segment_end
+            segment_duration = current_segment_end - current_segment_start
+            
+            # Split if pause is too long OR segment is too long
+            if pause_duration >= pause_threshold or segment_duration >= max_segment_duration:
+                # Save current segment if it's long enough
+                if segment_duration >= min_segment_duration:
+                    start_sample = int(current_segment_start * sample_rate)
+                    end_sample = int(current_segment_end * sample_rate)
+                    segments.append((start_sample, end_sample))
+                
+                # Start new segment
+                current_segment_start = word_start
+                current_segment_end = word_end
+            else:
+                # Extend current segment
+                current_segment_end = word_end
+    
+    # Add final segment
+    if current_segment_start is not None:
+        segment_duration = current_segment_end - current_segment_start
+        if segment_duration >= min_segment_duration:
+            start_sample = int(current_segment_start * sample_rate)
+            end_sample = int(current_segment_end * sample_rate)
+            segments.append((start_sample, end_sample))
+    
+    logger.debug(f"Detected {len(segments)} segments from {len(word_alignments)} word timestamps")
+    return segments
 
 
 def detect_speech_segments(audio: np.ndarray, sample_rate: int, 
@@ -831,7 +992,7 @@ def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict
                                        output_paths: Dict[str, str],
                                        target_duration: float = 30.0,
                                        logger: logging.Logger = None) -> None:
-    """Create a conversation by loading segments on-demand and saving directly to disk.
+    """Create a conversation by batch-loading segments to minimize file loading.
     
     Args:
         speaker1_info: Dict with 'audio_path' and 'sample_rate' for speaker 1
@@ -849,6 +1010,39 @@ def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict
     
     # Maximum segment duration to avoid overly long monologues
     max_segment_duration = 8.0  # seconds
+    
+    # Function to batch load segments from audio files
+    def batch_load_segments(audio_path: str, timestamps: List[Tuple[float, float]], 
+                           target_sample_rate: int) -> Dict[Tuple[float, float], np.ndarray]:
+        """Load all segments from a single audio file at once."""
+        logger.info(f"Batch loading {len(timestamps)} segments from {Path(audio_path).name}")
+        
+        # Load the audio file once
+        audio, orig_sr = load_audio_from_path(audio_path, logger)
+        
+        # Resample if needed
+        if orig_sr != target_sample_rate:
+            audio = resample_audio(audio, orig_sr, target_sample_rate)
+        
+        # Extract all segments
+        segments = {}
+        for start_time, end_time in timestamps:
+            start_sample = int(start_time * target_sample_rate)
+            end_sample = int(end_time * target_sample_rate)
+            
+            # Ensure we don't go out of bounds
+            start_sample = max(0, start_sample)
+            end_sample = min(len(audio), end_sample)
+            
+            # Store segment with timestamp as key
+            segments[(start_time, end_time)] = audio[start_sample:end_sample].copy()
+        
+        # Free the full audio from memory
+        del audio
+        gc.collect()
+        
+        logger.debug(f"Extracted {len(segments)} segments, freed full audio from memory")
+        return segments
     
     # Process timestamps to crop long segments
     def crop_timestamps_if_needed(timestamps: List[Tuple[float, float]], max_duration: float) -> List[Tuple[float, float]]:
@@ -921,6 +1115,52 @@ def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict
     random.shuffle(speaker1_regular)
     random.shuffle(speaker2_regular)
     
+    # Collect all timestamps for batch loading
+    logger.info("Collecting all timestamps for batch loading...")
+    
+    # Group timestamps by audio file
+    timestamps_by_file = {}
+    
+    # Add speaker1 timestamps
+    if speaker1_info['audio_path'] not in timestamps_by_file:
+        timestamps_by_file[speaker1_info['audio_path']] = set()
+    timestamps_by_file[speaker1_info['audio_path']].update(speaker1_regular)
+    timestamps_by_file[speaker1_info['audio_path']].update(speaker1_short)
+    
+    # Add speaker2 timestamps
+    if speaker2_info['audio_path'] not in timestamps_by_file:
+        timestamps_by_file[speaker2_info['audio_path']] = set()
+    timestamps_by_file[speaker2_info['audio_path']].update(speaker2_regular)
+    timestamps_by_file[speaker2_info['audio_path']].update(speaker2_short)
+    
+    # Batch load all segments
+    logger.info(f"Batch loading segments from {len(timestamps_by_file)} unique audio files...")
+    all_segments = {}
+    total_timestamps = sum(len(ts) for ts in timestamps_by_file.values())
+    
+    for audio_path, timestamps in timestamps_by_file.items():
+        try:
+            # Convert set to list for batch loading
+            segments = batch_load_segments(audio_path, list(timestamps), sample_rate)
+            
+            # Store segments with audio_path prefix to handle same timestamps from different files
+            for timestamp, segment in segments.items():
+                all_segments[(audio_path, timestamp)] = segment
+        except Exception as e:
+            logger.error(f"Failed to batch load segments from {audio_path}: {e}")
+            # Continue with other files
+    
+    logger.info(f"Successfully pre-loaded {len(all_segments)} segments total from {total_timestamps} timestamps")
+    
+    # Calculate efficiency
+    if len(timestamps_by_file) > 0:
+        efficiency_ratio = total_timestamps / len(timestamps_by_file)
+        logger.info(f"Efficiency: Loading {len(timestamps_by_file)} files instead of {total_timestamps} ({efficiency_ratio:.1f}x reduction)")
+    
+    # Check if we have enough segments
+    if len(all_segments) == 0:
+        raise ValueError("Failed to pre-load any segments. Cannot create conversation.")
+    
     # Initialize audio arrays
     total_samples = int(target_duration * sample_rate)
     speaker1_audio = np.zeros(total_samples, dtype=np.float32)
@@ -982,19 +1222,15 @@ def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict
         if timestamp is None:
             continue
             
-        # Load the segment on-demand
+        # Get pre-loaded segment
         start_time, end_time = timestamp
-        try:
-            segment = load_audio_segment_from_path(
-                speaker_info['audio_path'],
-                start_time,
-                end_time,
-                sample_rate,
-                logger
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load segment [{start_time:.2f}-{end_time:.2f}s]: {e}")
+        segment_key = (speaker_info['audio_path'], (start_time, end_time))
+        
+        if segment_key not in all_segments:
+            logger.warning(f"Segment not found in pre-loaded segments: [{start_time:.2f}-{end_time:.2f}s]")
             continue
+            
+        segment = all_segments[segment_key]
         
         # Calculate where to place this segment
         # For the current speaker, ensure no self-overlap
@@ -1100,17 +1336,13 @@ def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict
                 s2_short_idx += 1
                 
             if interjection_timestamp is not None:
-                # Load interjection on-demand
-                try:
-                    interjection = load_audio_segment_from_path(
-                        interjection_info['audio_path'],
-                        interjection_timestamp[0],
-                        interjection_timestamp[1],
-                        sample_rate,
-                        logger
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to load interjection: {e}")
+                # Get pre-loaded interjection
+                interjection_key = (interjection_info['audio_path'], interjection_timestamp)
+                
+                if interjection_key in all_segments:
+                    interjection = all_segments[interjection_key]
+                else:
+                    logger.warning(f"Interjection not found in pre-loaded segments")
                     interjection = None
                     
             if interjection is not None:
@@ -1207,18 +1439,14 @@ def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict
                 fill_speaker = 2 if fill_speaker == 1 else 1
                 continue
                 
-            # Load segment on-demand
-            try:
-                segment = load_audio_segment_from_path(
-                    speaker_info['audio_path'],
-                    timestamp[0],
-                    timestamp[1],
-                    sample_rate,
-                    logger
-                )
-            except Exception as e:
-                logger.warning(f"Failed to load fill segment: {e}")
+            # Get pre-loaded fill segment
+            segment_key = (speaker_info['audio_path'], timestamp)
+            
+            if segment_key not in all_segments:
+                logger.warning(f"Fill segment not found in pre-loaded segments")
                 continue
+                
+            segment = all_segments[segment_key]
                 
             # Place segment
             if fill_speaker == 1:
@@ -1298,6 +1526,9 @@ def create_conversation_from_timestamps(speaker1_info: Dict, speaker2_info: Dict
         del mixed_audio
         del speaker1_audio  
         del speaker2_audio
+        # Clean up pre-loaded segments
+        all_segments.clear()
+        del all_segments
         gc.collect()
 
 
@@ -1321,7 +1552,8 @@ def generate_conversations_from_real_audio(output_dir: str,
                                          max_samples_to_load: int = 1000,
                                          streaming: bool = False,
                                          use_vad: bool = True,
-                                         hard_sample_percentage: float = 0.3) -> None:
+                                         hard_sample_percentage: float = 0.3,
+                                         pause_threshold: float = 0.5) -> None:
     """Generate conversation dataset from real single-speaker audio files."""
     
     # Setup logging
@@ -1337,6 +1569,7 @@ def generate_conversations_from_real_audio(output_dir: str,
     logger.info(f"Streaming mode: {'enabled' if streaming else 'disabled'}")
     logger.info(f"VAD segmentation: {'enabled' if use_vad else 'disabled (using random segmentation)'}")
     logger.info(f"Hard sample percentage: {hard_sample_percentage * 100:.0f}% (similar speakers)")
+    logger.info(f"Pause threshold: {pause_threshold}s (for word timestamp-based segmentation)")
     logger.info(f"Early stopping: Will process up to {target_duration * 2:.0f}s of audio per file")
     
     # List parquet files
@@ -1353,6 +1586,7 @@ def generate_conversations_from_real_audio(output_dir: str,
         max_samples_to_load, 
         target_sample_rate,
         use_vad,
+        pause_threshold,
         logger
     )
     
@@ -1661,6 +1895,8 @@ def main():
                       help="Disable VAD and use random segmentation instead")
     parser.add_argument("--hard_sample_percentage", type=float, default=0.3,
                       help="Percentage of conversations that should be hard samples (similar speakers, 0.0-1.0)")
+    parser.add_argument("--pause_threshold", type=float, default=0.5,
+                      help="Minimum pause duration in seconds to split segments when using word timestamps")
     
     args = parser.parse_args()
     
@@ -1674,7 +1910,8 @@ def main():
         args.max_samples,
         args.streaming,
         use_vad=not args.no_vad,
-        hard_sample_percentage=args.hard_sample_percentage
+        hard_sample_percentage=args.hard_sample_percentage,
+        pause_threshold=args.pause_threshold
     )
 
 
