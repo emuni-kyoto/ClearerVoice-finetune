@@ -433,7 +433,7 @@ def load_single_speaker_dataset(parquet_files: List[str],
     shuffled_files = parquet_files.copy()
     random.shuffle(shuffled_files)
     
-    pbar = tqdm(total=max_samples, desc="Loading samples", unit="samples")
+    pbar = tqdm(total=max_samples, desc="Loading samples", unit="samples", leave=True)
     
     for file_idx, parquet_file in enumerate(shuffled_files):
         try:
