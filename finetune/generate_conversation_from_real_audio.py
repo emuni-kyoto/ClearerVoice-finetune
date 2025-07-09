@@ -520,22 +520,22 @@ def load_single_speaker_dataset(parquet_files: List[str],
             
             files_processed += 1
             
-            # Clean up temporary file
-            try:
-                if os.path.exists(local_parquet_path):
-                    os.remove(local_parquet_path)
-                    logger.debug(f"Cleaned up temporary file: {local_parquet_path}")
-            except Exception as cleanup_error:
-                logger.warning(f"Failed to clean up temporary file: {cleanup_error}")
+            # Skip cleanup to preserve cached files
+            # try:
+            #     if os.path.exists(local_parquet_path):
+            #         os.remove(local_parquet_path)
+            #         logger.debug(f"Cleaned up temporary file: {local_parquet_path}")
+            # except Exception as cleanup_error:
+            #     logger.warning(f"Failed to clean up temporary file: {cleanup_error}")
             
         except Exception as e:
             logger.warning(f"Failed to process {parquet_file}: {e}")
-            # Clean up temporary file on error
-            try:
-                if 'local_parquet_path' in locals() and os.path.exists(local_parquet_path):
-                    os.remove(local_parquet_path)
-            except Exception:
-                pass
+            # Skip cleanup to preserve cached files even on error
+            # try:
+            #     if 'local_parquet_path' in locals() and os.path.exists(local_parquet_path):
+            #         os.remove(local_parquet_path)
+            # except Exception:
+            #     pass
             continue
     
     pbar.close()
@@ -1571,6 +1571,7 @@ def generate_conversations_from_real_audio(output_dir: str,
     logger.info(f"Hard sample percentage: {hard_sample_percentage * 100:.0f}% (similar speakers)")
     logger.info(f"Pause threshold: {pause_threshold}s (for word timestamp-based segmentation)")
     logger.info(f"Early stopping: Will process up to {target_duration * 2:.0f}s of audio per file")
+    logger.info("Caching: Downloaded files are preserved in /tmp/parquet_downloads/ and /tmp/audio_downloads/")
     
     # List parquet files
     parquet_files = list_parquet_files(bucket_name, prefix, logger)
